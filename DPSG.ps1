@@ -15,7 +15,7 @@ Key Features:
 #>
 
 param(
-    [string]$Model = "gpt-4",
+    [string]$Model = "gpt-4o",
     [int]$MaxTokens = 8000,
     [float]$Temperature = 0.2,
     [string]$ApiKey,
@@ -140,265 +140,47 @@ function Show-GenerationProgress {
     }
 }
 
-function Request-ScriptGeneration {
-    [CmdletBinding(DefaultParameterSetName = "SingleInput")]
-    param (
-        [Parameter(Mandatory=$true, ParameterSetName="SingleInput", Position=0)]
-        [Alias("UserMessage","UserPrompt","Prompt","Input","Request","Query")]
-        [ValidateNotNullOrEmpty()]
-        [string]$UserInput,
-        [Parameter(Mandatory=$true, ParameterSetName="ContextMessages")]
-        [Alias("Context","Messages","Conversation")]
-        [ValidateNotNullOrEmpty()]
-        [array]$ContextMessages,
-        [Parameter(ParameterSetName="SingleInput")]
-        [Parameter(ParameterSetName="ContextMessages")]
-        [string]$SystemPrompt = @"
-You are a PowerShell expert assistant that generates complete, working PowerShell GUI applications.
-When generating PowerShell scripts, output only valid PowerShell code with no markdown or commentary.
-Focus on creating functional Windows Forms applications that users can run immediately.
-Include proper error handling and user-friendly interfaces.
-"@,
-        [Parameter()]
-        [ValidateNotNullOrEmpty()]
-        [string]$Model = "gpt-4",
-        [Parameter()]
-        [ValidateRange(1, 8000)]
-        [int]$MaxTokens = 8000,
-        [Parameter()]
-        [ValidateRange(0.0, 2.0)]
-        [double]$Temperature = 0.3,
-        [Parameter()]
-        [ValidateNotNullOrEmpty()]
-        [string]$ApiKey = $env:OPENAI_API_KEY
-    )
-    
-    begin {
-        if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-            throw "API key is required. Please provide via -ApiKey parameter or set OPENAI_API_KEY environment variable"
-        }
-        
-        $maxRetries = 3
-        $retryDelay = 2
-        $url = "https://api.openai.com/v1/chat/completions"
-    }
-    
-    process {
-        try {
-            switch ($PSCmdlet.ParameterSetName) {
-                "SingleInput" {
-                    $messages = @(
-                        @{
-                            role = "system"
-                            content = $SystemPrompt
-                        },
-                        @{
-                            role = "user"
-                            content = $UserInput
-                        }
-                    )
-                    Write-LogMessage "Processing API request..." "DEBUG"
-                }
-                "ContextMessages" {
-                    if ($ContextMessages.Count -eq 0) {
-                        throw "ContextMessages array cannot be empty"
-                    }
-                    foreach ($msg in $ContextMessages) {
-                        if (-not $msg.role -or -not $msg.content) {
-                            throw "Each context message must contain role and content properties"
-                        }
-                    }
-                    $messages = $ContextMessages
-                    Write-LogMessage "Processing context messages request" "DEBUG"
-                }
-            }
-            
-            $requestBody = @{
-                model = $Model
-                messages = $messages
-                max_tokens = $MaxTokens
-                temperature = $Temperature
-            }
-            
-            for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
-                try {
-                    Show-GenerationProgress -Activity "Contacting OpenAI API" -Status "Sending request (attempt $attempt)" -PercentComplete (20 * $attempt)
-                    
-                    $jsonBody = $requestBody | ConvertTo-Json -Depth 10 -Compress
-                    if (-not $jsonBody) {
-                        throw "Failed to serialize request to JSON"
-                    }
-                    
-                    $headers = @{
-                        "Authorization" = "Bearer $ApiKey"
-                        "Content-Type" = "application/json"
-                        "User-Agent" = "DPSG-PowerShell-Generator/2.0"
-                    }
-                    
-                    Write-LogMessage "Sending request to OpenAI API (Attempt $attempt/$maxRetries)" "INFO"
-                    
-                    $response = Invoke-RestMethod -Uri $url -Method Post -Headers $headers -Body $jsonBody -ErrorAction Stop -TimeoutSec 120
-                    
-                    if (-not $response -or -not $response.choices -or $response.choices.Count -eq 0) {
-                        throw "Invalid response format - no choices returned from API"
-                    }
-                    
-                    $content = $response.choices[0].message.content
-                    if ([string]::IsNullOrWhiteSpace($content)) {
-                        throw "Empty response content received from API"
-                    }
-                    
-                    Show-GenerationProgress -Activity "Processing Response" -Status "Validating content" -PercentComplete 90
-                    Show-GenerationProgress -Activity "Complete" -Status "Success" -PercentComplete 100
-                    
-                    Start-Sleep -Milliseconds 500  # Brief pause to show completion
-                    Write-LogMessage "API request completed successfully" "INFO"
-                    return $content.Trim()
-                }
-                catch {
-                    $errorMsg = $_.Exception.Message
-                    $shouldRetry = $false
-                    
-                    # Handle specific error types
-                    if ($_.Exception.Response) {
-                        try {
-                            $errorStream = $_.Exception.Response.GetResponseStream()
-                            $reader = New-Object System.IO.StreamReader($errorStream)
-                            $errorResponse = $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction SilentlyContinue
-                            
-                            if ($errorResponse -and $errorResponse.error) {
-                                $errorMsg = $errorResponse.error.message
-                                $errorType = $errorResponse.error.type
-                                
-                                Write-LogMessage "OpenAI API Error Type: $errorType" "ERROR"
-                                Write-LogMessage "OpenAI API Error Message: $errorMsg" "ERROR"
-                                
-                                # Handle specific error types
-                                if ($errorType -eq "invalid_api_key" -or $errorMsg -match "api key") {
-                                    Write-LogMessage "API key is invalid. Please check your OpenAI API key." "ERROR"
-                                    throw "Invalid API key. Please verify your OpenAI API key is correct."
-                                } elseif ($errorType -eq "rate_limit_exceeded" -or $errorMsg -match "rate limit") {
-                                    $retryAfter = 5
-                                    if ($_.Exception.Response.Headers["Retry-After"]) {
-                                        $retryAfter = [int]$_.Exception.Response.Headers["Retry-After"]
-                                    }
-                                    Write-LogMessage "Rate limit hit - waiting $retryAfter seconds before retry" "WARNING"
-                                    Start-Sleep -Seconds $retryAfter
-                                    $shouldRetry = $true
-                                } elseif ($_.Exception.Response.StatusCode -eq 400) {
-                                    Write-LogMessage "Bad Request (400) - Check API key format and request parameters" "ERROR"
-                                    Write-LogMessage "Request URL: $url" "DEBUG"
-                                    Write-LogMessage "API Key starts with: $($ApiKey.Substring(0, [Math]::Min(7, $ApiKey.Length)))..." "DEBUG"
-                                }
-                            } else {
-                                Write-LogMessage "HTTP Status: $($_.Exception.Response.StatusCode)" "ERROR"
-                                Write-LogMessage "HTTP Status Description: $($_.Exception.Response.StatusDescription)" "ERROR"
-                            }
-                        } catch {
-                            Write-LogMessage "Could not parse error response: $($_.Exception.Message)" "DEBUG"
-                        }
-                    }
-                    
-                    if ($attempt -eq $maxRetries -or -not $shouldRetry) {
-                        Write-LogMessage "API request failed after $attempt attempts: $errorMsg" "ERROR"
-                        Show-GenerationProgress -Activity "Failed" -Status "Error occurred" -PercentComplete -1
-                        throw "OpenAI API request failed: $errorMsg"
-                    }
-                    
-                    if (-not $shouldRetry) {
-                        Write-LogMessage "Attempt $attempt failed ($errorMsg), retrying in $retryDelay seconds..." "WARNING"
-                        Start-Sleep -Seconds $retryDelay
-                        $retryDelay = [math]::Min($retryDelay * 1.5, 30)  # Exponential backoff with cap
-                    }
-                }
-            }
-        }
-        catch {
-            Write-LogMessage "Fatal error in API request: $($_.Exception.Message)" "ERROR"
-            Show-GenerationProgress -Activity "Failed" -Status "Fatal error" -PercentComplete -1
-            throw
-        }
-        finally {
-            Write-Progress -Activity "Complete" -Completed
-        }
-    }
-}
-
-function Show-ErrorMessage {
-    param([string]$Message)
-    [void][System.Windows.Forms.MessageBox]::Show(
-        $form,
-        $Message,
-        "Error",
-        [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]::Error,
-        [System.Windows.Forms.MessageBoxDefaultButton]::Button1,
-        [System.Windows.Forms.MessageBoxOptions]::ServiceNotification
-    )
-    $form.TopMost = $true
-    $form.Activate()
-}
-
-function Test-ApiKeyConnection {
-    param([string]$TestApiKey)
-    
-    try {
-        Write-LogMessage "Testing API key connection..." "DEBUG"
-        
-        $headers = @{
-            "Authorization" = "Bearer $TestApiKey"
-            "Content-Type" = "application/json"
-        }
-        
-        $testBody = @{
-            model = "gpt-3.5-turbo"
-            messages = @(@{
-                role = "user"
-                content = "Test connection"
-            })
-            max_tokens = 5
-        } | ConvertTo-Json -Depth 3
-        
-        $response = Invoke-RestMethod -Uri "https://api.openai.com/v1/chat/completions" -Method Post -Headers $headers -Body $testBody -TimeoutSec 10
-        
-        if ($response -and $response.choices) {
-            Write-LogMessage "API key connection test successful" "INFO"
-            return $true
-        }
-    }
-    catch {
-        $errorMsg = $_.Exception.Message
-        if ($errorMsg -match "401" -or $errorMsg -match "Unauthorized") {
-            Write-LogMessage "API key connection test failed: Invalid API key" "ERROR"
-        } else {
-            Write-LogMessage "API key connection test failed: $errorMsg" "ERROR"
-        }
-        return $false
-    }
-    
-    return $false
-}
-
 function Get-ApiKey {
-    Write-LogMessage "Attempting to retrieve API key..." "DEBUG"
+    Write-LogMessage "Attempting to retrieve API key from environment..." "DEBUG"
     
     # Start with the parameter if provided
     $retrievedApiKey = $ApiKey
     
     if ([string]::IsNullOrWhiteSpace($retrievedApiKey)) {
-        # Check environment variables
-        Write-LogMessage "Checking User environment variable..." "DEBUG"
-        $retrievedApiKey = [Environment]::GetEnvironmentVariable("OPENAI_API_KEY", "User")
+        # Check environment variables in priority order
+        Write-LogMessage "Checking Process environment variable..." "DEBUG"
+        $retrievedApiKey = $env:OPENAI_API_KEY
+        
+        if ([string]::IsNullOrWhiteSpace($retrievedApiKey)) {
+            Write-LogMessage "Checking User environment variable..." "DEBUG"
+            $retrievedApiKey = [Environment]::GetEnvironmentVariable("OPENAI_API_KEY", "User")
+        }
         
         if ([string]::IsNullOrWhiteSpace($retrievedApiKey)) {
             Write-LogMessage "Checking Machine environment variable..." "DEBUG"
             $retrievedApiKey = [Environment]::GetEnvironmentVariable("OPENAI_API_KEY", "Machine")
         }
+    }
+    
+    # Clean and validate the API key
+    if (-not [string]::IsNullOrWhiteSpace($retrievedApiKey)) {
+        # Remove any whitespace, newlines, or hidden characters
+        $retrievedApiKey = $retrievedApiKey.Trim().Replace("`r", "").Replace("`n", "").Replace("`t", "")
         
-        if ([string]::IsNullOrWhiteSpace($retrievedApiKey)) {
-            Write-LogMessage "Checking Process environment variable..." "DEBUG"
-            $retrievedApiKey = $env:OPENAI_API_KEY
+        # Remove any quotes that might have been included
+        $retrievedApiKey = $retrievedApiKey.Trim('"').Trim("'")
+        
+        # Validate reasonable length
+        if ($retrievedApiKey.Length -gt 300) {
+            Write-LogMessage "API key appears corrupted (length: $($retrievedApiKey.Length))" "WARNING"
+            Write-LogMessage "Key starts with: '$($retrievedApiKey.Substring(0, [Math]::Min(50, $retrievedApiKey.Length)))'" "DEBUG"
+            return $null
         }
+        
+        Write-LogMessage "API key retrieved successfully" "DEBUG"
+        Write-LogMessage "API key length: $($retrievedApiKey.Length)" "DEBUG"
+        Write-LogMessage "API key format: $($retrievedApiKey.Substring(0, [Math]::Min(15, $retrievedApiKey.Length)))..." "DEBUG"
+        return $retrievedApiKey
     }
     
     # If still no key found, prompt user
@@ -415,18 +197,9 @@ function Get-ApiKey {
                         break
                     }
                 } else {
-                    # Test the API key
-                    if (Test-ApiKeyConnection $retrievedApiKey.Trim()) {
-                        Write-LogMessage "API key validated successfully" "INFO"
-                        break
-                    } else {
-                        $result = [System.Windows.Forms.MessageBox]::Show("The API key you entered appears to be invalid or unauthorized.`n`nWould you like to try entering it again?", "Invalid API Key", "YesNo", "Warning")
-                        if ($result -eq "No") {
-                            $retrievedApiKey = $null
-                            break
-                        }
-                        $retrievedApiKey = $null
-                    }
+                    # Clean the input
+                    $retrievedApiKey = $retrievedApiKey.Trim().Replace("`r", "").Replace("`n", "").Replace("`t", "").Trim('"').Trim("'")
+                    break
                 }
             } while ($true)
         } else {
@@ -442,23 +215,17 @@ function Get-ApiKey {
                 }
                 
                 if (-not [string]::IsNullOrWhiteSpace($retrievedApiKey)) {
-                    if (Test-ApiKeyConnection $retrievedApiKey.Trim()) {
-                        Write-Host "API key validated successfully!" -ForegroundColor Green
-                        break
-                    } else {
-                        Write-Host "The API key appears to be invalid. Please try again." -ForegroundColor Red
-                        $retrievedApiKey = $null
-                    }
+                    $retrievedApiKey = $retrievedApiKey.Trim().Replace("`r", "").Replace("`n", "").Replace("`t", "").Trim('"').Trim("'")
+                    break
                 }
             } while ($true)
         }
     }
     
-    # Final validation and cleanup
     if (-not [string]::IsNullOrWhiteSpace($retrievedApiKey)) {
-        $retrievedApiKey = $retrievedApiKey.Trim()
-        Write-LogMessage "API key retrieved successfully" "DEBUG"
-        Write-LogMessage "API key format: $($retrievedApiKey.Substring(0, [Math]::Min(7, $retrievedApiKey.Length)))... (length: $($retrievedApiKey.Length))" "DEBUG"
+        Write-LogMessage "API key obtained successfully" "DEBUG"
+        Write-LogMessage "API key length: $($retrievedApiKey.Length)" "DEBUG"
+        Write-LogMessage "API key format: $($retrievedApiKey.Substring(0, [Math]::Min(15, $retrievedApiKey.Length)))..." "DEBUG"
     } else {
         Write-LogMessage "No valid API key could be obtained" "ERROR"
     }
@@ -551,6 +318,206 @@ function Test-PowerShellScriptSyntax {
     }
 }
 
+function Request-ScriptGeneration {
+    [CmdletBinding(DefaultParameterSetName = "SingleInput")]
+    param (
+        [Parameter(Mandatory=$true, ParameterSetName="SingleInput", Position=0)]
+        [Alias("UserMessage","UserPrompt","Prompt","Input","Request","Query")]
+        [ValidateNotNullOrEmpty()]
+        [string]$UserInput,
+        [Parameter(Mandatory=$true, ParameterSetName="ContextMessages")]
+        [Alias("Context","Messages","Conversation")]
+        [ValidateNotNullOrEmpty()]
+        [array]$ContextMessages,
+        [Parameter(ParameterSetName="SingleInput")]
+        [Parameter(ParameterSetName="ContextMessages")]
+        [string]$SystemPrompt = @"
+You are a PowerShell expert assistant that generates complete, working PowerShell GUI applications.
+When generating PowerShell scripts, output only valid PowerShell code with no markdown or commentary.
+Focus on creating functional Windows Forms applications that users can run immediately.
+Include proper error handling and user-friendly interfaces.
+"@,
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$Model = "gpt-4o",
+        [Parameter()]
+        [ValidateRange(1, 8000)]
+        [int]$MaxTokens = 8000,
+        [Parameter()]
+        [ValidateRange(0.0, 2.0)]
+        [double]$Temperature = 0.3,
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$ApiKey = $global:ApiKey
+    )
+    
+    begin {
+        if ([string]::IsNullOrWhiteSpace($ApiKey)) {
+            throw "API key is required. Please provide via -ApiKey parameter or set OPENAI_API_KEY environment variable"
+        }
+        
+        # Clean the API key
+        $ApiKey = $ApiKey.Trim().Replace("`r", "").Replace("`n", "").Replace("`t", "").Trim('"').Trim("'")
+        
+        Write-LogMessage "Final API key being sent: length=$($ApiKey.Length), starts with: '$($ApiKey.Substring(0, [Math]::Min(20, $ApiKey.Length)))'" "DEBUG"
+        
+        # Final validation before sending
+        if ($ApiKey.Length -gt 300) {
+            Write-LogMessage "ERROR: API key appears corrupted (length: $($ApiKey.Length)) - cannot proceed" "ERROR"
+            throw "API key appears corrupted after cleaning. Length: $($ApiKey.Length)"
+        }
+        
+        $maxRetries = 3
+        $retryDelay = 2
+        $url = "https://api.openai.com/v1/chat/completions"
+        $retryDelay = 2
+        $url = "https://api.openai.com/v1/chat/completions"
+    }
+    
+    process {
+        try {
+            switch ($PSCmdlet.ParameterSetName) {
+                "SingleInput" {
+                    $messages = @(
+                        @{
+                            role = "system"
+                            content = $SystemPrompt
+                        },
+                        @{
+                            role = "user"
+                            content = $UserInput
+                        }
+                    )
+                    Write-LogMessage "Processing API request..." "DEBUG"
+                }
+                "ContextMessages" {
+                    if ($ContextMessages.Count -eq 0) {
+                        throw "ContextMessages array cannot be empty"
+                    }
+                    foreach ($msg in $ContextMessages) {
+                        if (-not $msg.role -or -not $msg.content) {
+                            throw "Each context message must contain role and content properties"
+                        }
+                    }
+                    $messages = $ContextMessages
+                    Write-LogMessage "Processing context messages request" "DEBUG"
+                }
+            }
+            
+            $requestBody = @{
+                model = $Model
+                messages = $messages
+                max_tokens = $MaxTokens
+                temperature = $Temperature
+            }
+            
+            for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+                try {
+                    Show-GenerationProgress -Activity "Contacting OpenAI API" -Status "Sending request (attempt $attempt)" -PercentComplete (20 * $attempt)
+                    
+                    $jsonBody = $requestBody | ConvertTo-Json -Depth 10 -Compress
+                    if (-not $jsonBody) {
+                        throw "Failed to serialize request to JSON"
+                    }
+                    
+                    $headers = @{
+                        "Authorization" = "Bearer $ApiKey"
+                        "Content-Type" = "application/json"
+                        "User-Agent" = "DPSG-PowerShell-Generator/2.0"
+                    }
+                    
+                    Write-LogMessage "Sending request to OpenAI API (Attempt $attempt/$maxRetries)" "INFO"
+                    Write-LogMessage "Using model: $Model" "DEBUG"
+                    Write-LogMessage "Request body size: $($jsonBody.Length) characters" "DEBUG"
+                    
+                    $response = Invoke-RestMethod -Uri $url -Method Post -Headers $headers -Body $jsonBody -ErrorAction Stop -TimeoutSec 120
+                    
+                    if (-not $response -or -not $response.choices -or $response.choices.Count -eq 0) {
+                        throw "Invalid response format - no choices returned from API"
+                    }
+                    
+                    $content = $response.choices[0].message.content
+                    if ([string]::IsNullOrWhiteSpace($content)) {
+                        throw "Empty response content received from API"
+                    }
+                    
+                    Show-GenerationProgress -Activity "Processing Response" -Status "Validating content" -PercentComplete 90
+                    Show-GenerationProgress -Activity "Complete" -Status "Success" -PercentComplete 100
+                    
+                    Start-Sleep -Milliseconds 500  # Brief pause to show completion
+                    Write-LogMessage "API request completed successfully" "INFO"
+                    return $content.Trim()
+                }
+                catch {
+                    $errorMsg = $_.Exception.Message
+                    $shouldRetry = $false
+                    
+                    # Handle specific error types
+                    if ($_.Exception.Response) {
+                        try {
+                            $errorStream = $_.Exception.Response.GetResponseStream()
+                            $reader = New-Object System.IO.StreamReader($errorStream)
+                            $errorResponse = $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction SilentlyContinue
+                            
+                            if ($errorResponse -and $errorResponse.error) {
+                                $errorMsg = $errorResponse.error.message
+                                $errorType = $errorResponse.error.type
+                                
+                                Write-LogMessage "OpenAI API Error Type: $errorType" "ERROR"
+                                Write-LogMessage "OpenAI API Error Message: $errorMsg" "ERROR"
+                                
+                                # Handle specific error types
+                                if ($errorType -eq "invalid_api_key" -or $errorMsg -match "api key") {
+                                    Write-LogMessage "API key is invalid. Please check your OpenAI API key." "ERROR"
+                                    throw "Invalid API key. Please verify your OpenAI API key is correct."
+                                } elseif ($errorType -eq "rate_limit_exceeded" -or $errorMsg -match "rate limit") {
+                                    $retryAfter = 5
+                                    if ($_.Exception.Response.Headers["Retry-After"]) {
+                                        $retryAfter = [int]$_.Exception.Response.Headers["Retry-After"]
+                                    }
+                                    Write-LogMessage "Rate limit hit - waiting $retryAfter seconds before retry" "WARNING"
+                                    Start-Sleep -Seconds $retryAfter
+                                    $shouldRetry = $true
+                                } elseif ($_.Exception.Response.StatusCode -eq 400) {
+                                    Write-LogMessage "Bad Request (400) - Check model name and request parameters" "ERROR"
+                                    Write-LogMessage "Model used: $Model" "ERROR"
+                                    Write-LogMessage "API Error Details: $errorMsg" "ERROR"
+                                    throw "Bad Request (400): $errorMsg. Check if model '$Model' is valid."
+                                }
+                            } else {
+                                Write-LogMessage "HTTP Status: $($_.Exception.Response.StatusCode)" "ERROR"
+                                Write-LogMessage "HTTP Status Description: $($_.Exception.Response.StatusDescription)" "ERROR"
+                            }
+                        } catch {
+                            Write-LogMessage "Could not parse error response: $($_.Exception.Message)" "DEBUG"
+                        }
+                    }
+                    
+                    if ($attempt -eq $maxRetries -or -not $shouldRetry) {
+                        Write-LogMessage "API request failed after $attempt attempts: $errorMsg" "ERROR"
+                        Show-GenerationProgress -Activity "Failed" -Status "Error occurred" -PercentComplete -1
+                        throw "OpenAI API request failed: $errorMsg"
+                    }
+                    
+                    if (-not $shouldRetry) {
+                        Write-LogMessage "Attempt $attempt failed ($errorMsg), retrying in $retryDelay seconds..." "WARNING"
+                        Start-Sleep -Seconds $retryDelay
+                        $retryDelay = [math]::Min($retryDelay * 1.5, 30)  # Exponential backoff with cap
+                    }
+                }
+            }
+        }
+        catch {
+            Write-LogMessage "Fatal error in API request: $($_.Exception.Message)" "ERROR"
+            Show-GenerationProgress -Activity "Failed" -Status "Fatal error" -PercentComplete -1
+            throw
+        }
+        finally {
+            Write-Progress -Activity "Complete" -Completed
+        }
+    }
+}
+
 function New-PowerShellApp {
     param(
         [string]$UserDescription,
@@ -564,9 +531,60 @@ function New-PowerShellApp {
     Write-LogMessage "  Global API key length: $($global:ApiKey.Length)" "DEBUG"
     
     try {
-        # Generate the PowerShell script
-        $template = Analyze-UserPrompt $UserDescription
-        $appScript = if ($template) { $template.Template } else {
+        # Check if this is a template request (marked with *)
+        $useTemplate = $false
+        $cleanDescription = $UserDescription
+        
+        if ($UserDescription.StartsWith("*TEMPLATE*")) {
+            $useTemplate = $true
+            $cleanDescription = $UserDescription.Replace("*TEMPLATE*", "").Trim()
+            Write-LogMessage "Template mode detected for: $cleanDescription" "INFO"
+        }
+        
+        # Generate the PowerShell script - ALWAYS use API unless explicitly marked as template
+        $appScript = if ($useTemplate) {
+            $template = Analyze-UserPrompt $cleanDescription
+            if ($template) {
+                Write-LogMessage "Using template: $($template.Name)" "INFO"
+                $template.Template
+            } else {
+                Write-LogMessage "No matching template found, using API generation" "INFO"
+                Request-ScriptGeneration -ApiKey $global:ApiKey -UserInput @"
+Create a complete, working PowerShell GUI application based on: $cleanDescription
+
+IMPORTANT REQUIREMENTS:
+- Use Windows Forms (Add-Type -AssemblyName System.Windows.Forms and System.Drawing)
+- Include proper error handling with try-catch blocks
+- Make all functionality self-contained with no external dependencies
+- Use proper PowerShell syntax that works with ps2exe compilation
+- Escape variables properly in here-strings and complex expressions
+- Include a Close button that calls `$form.Close()
+- Wrap the main code in try-catch for error handling
+- Test that all object constructors have proper syntax
+
+EXAMPLE STRUCTURE:
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+try {
+    `$form = New-Object System.Windows.Forms.Form
+    `$form.Text = "Application Title"
+    `$form.Size = New-Object System.Drawing.Size(800, 600)
+    `$form.StartPosition = "CenterScreen"
+    
+    # Add your controls here
+    
+    [void]`$form.ShowDialog()
+} catch {
+    [System.Windows.Forms.MessageBox]::Show("Error: `$(`$_.Exception.Message)", "Application Error")
+}
+
+Generate a complete, functional application based on this structure.
+"@
+            }
+        } else {
+            # ALWAYS use OpenAI API for dynamic generation (this is the main purpose!)
+            Write-LogMessage "Using OpenAI API for dynamic generation" "INFO"
             Request-ScriptGeneration -ApiKey $global:ApiKey -UserInput @"
 Create a complete, working PowerShell GUI application based on: $UserDescription
 
@@ -945,15 +963,27 @@ function Set-LastOutputFolder {
     }
 }
 
+function Show-ErrorMessage {
+    param([string]$Message)
+    [void][System.Windows.Forms.MessageBox]::Show(
+        $form,
+        $Message,
+        "Error",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error,
+        [System.Windows.Forms.MessageBoxDefaultButton]::Button1,
+        [System.Windows.Forms.MessageBoxOptions]::ServiceNotification
+    )
+    $form.TopMost = $true
+    $form.Activate()
+}
+
+#endregion
+
 #region Main Execution
 Write-LogMessage "Starting DPSG initialization..." "INFO"
-Write-LogMessage "Calling Get-ApiKey function..." "DEBUG"
 
 $global:ApiKey = Get-ApiKey
-
-Write-LogMessage "Get-ApiKey function completed" "DEBUG"
-Write-LogMessage "Retrieved API key length: $($global:ApiKey.Length)" "DEBUG"
-Write-LogMessage "Retrieved API key starts with: $($global:ApiKey.Substring(0, [Math]::Min(10, $global:ApiKey.Length)))..." "DEBUG"
 
 if ([string]::IsNullOrWhiteSpace($global:ApiKey)) {
     Write-LogMessage "FATAL: No valid API key available. Cannot proceed." "ERROR"
@@ -1281,7 +1311,8 @@ if ($Gui) {
             try {
                 if ($listBox.SelectedIndex -ge 0 -and $listBox.SelectedIndex -lt $templateArray.Count) {
                     $selectedTemplate = $templateArray[$listBox.SelectedIndex]
-                    $script:txtPrompt.Text = $selectedTemplate.Description
+                    # Add template marker so the script knows to use template instead of API
+                    $script:txtPrompt.Text = "*TEMPLATE* $($selectedTemplate.Description)"
                     
                     # Find and set the createapp option
                     for ($i = 0; $i -lt $cmbAction.Items.Count; $i++) {
@@ -1291,7 +1322,7 @@ if ($Gui) {
                         }
                     }
                     
-                    Write-LogMessage "Inserted template: $($selectedTemplate.Name)" "INFO"
+                    Write-LogMessage "Inserted template: $($selectedTemplate.Name) with template marker" "INFO"
                     $exampleForm.Close()
                 } else {
                     Write-LogMessage "No template selected or invalid selection" "WARNING"
@@ -1501,3 +1532,4 @@ else {
         exit 1
     }
 }
+#endregion
