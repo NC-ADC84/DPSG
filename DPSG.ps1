@@ -170,26 +170,62 @@ function Get-ApiKey {
         # Remove any quotes that might have been included
         $retrievedApiKey = $retrievedApiKey.Trim('"').Trim("'")
         
-        # Validate reasonable length
-        if ($retrievedApiKey.Length -gt 300) {
-            Write-LogMessage "API key appears corrupted (length: $($retrievedApiKey.Length))" "WARNING"
-            Write-LogMessage "Key starts with: '$($retrievedApiKey.Substring(0, [Math]::Min(50, $retrievedApiKey.Length)))'" "DEBUG"
-            return $null
+        # Detect corruption patterns
+        $isCorrupted = $false
+        
+        # Check for log message corruption (starts with timestamp)
+        if ($retrievedApiKey -match "^\[\d{2}:\d{2}:\d{2}\]") {
+            Write-LogMessage "CORRUPTION DETECTED: API key contains log timestamps" "ERROR"
+            $isCorrupted = $true
         }
         
-        Write-LogMessage "API key retrieved successfully" "DEBUG"
-        Write-LogMessage "API key length: $($retrievedApiKey.Length)" "DEBUG"
-        Write-LogMessage "API key format: $($retrievedApiKey.Substring(0, [Math]::Min(15, $retrievedApiKey.Length)))..." "DEBUG"
-        return $retrievedApiKey
+        # Check for excessive length
+        if ($retrievedApiKey.Length -gt 300) {
+            Write-LogMessage "CORRUPTION DETECTED: API key too long (length: $($retrievedApiKey.Length))" "ERROR"
+            $isCorrupted = $true
+        }
+        
+        # Check if it doesn't start with expected OpenAI format
+        if (-not ($retrievedApiKey -match "^sk-")) {
+            Write-LogMessage "CORRUPTION DETECTED: API key doesn't start with 'sk-'" "ERROR"
+            $isCorrupted = $true
+        }
+        
+        if ($isCorrupted) {
+            Write-LogMessage "Corrupted key preview: '$($retrievedApiKey.Substring(0, [Math]::Min(50, $retrievedApiKey.Length)))'" "DEBUG"
+            
+            # Try to extract valid key from corrupted data
+            if ($retrievedApiKey -match "(sk-proj-[a-zA-Z0-9\-_]{50,200})") {
+                $extractedKey = $matches[1]
+                Write-LogMessage "Successfully extracted project key from corruption" "INFO"
+                $retrievedApiKey = $extractedKey
+                $isCorrupted = $false
+            } elseif ($retrievedApiKey -match "(sk-[a-zA-Z0-9]{48})") {
+                $extractedKey = $matches[1]
+                Write-LogMessage "Successfully extracted standard key from corruption" "INFO"
+                $retrievedApiKey = $extractedKey
+                $isCorrupted = $false
+            } else {
+                Write-LogMessage "Could not extract valid API key from corrupted data" "ERROR"
+                $retrievedApiKey = $null
+            }
+        }
+        
+        if (-not $isCorrupted -and -not [string]::IsNullOrWhiteSpace($retrievedApiKey)) {
+            Write-LogMessage "API key retrieved successfully" "DEBUG"
+            Write-LogMessage "API key length: $($retrievedApiKey.Length)" "DEBUG"
+            Write-LogMessage "API key format: $($retrievedApiKey.Substring(0, [Math]::Min(15, $retrievedApiKey.Length)))..." "DEBUG"
+            return $retrievedApiKey
+        }
     }
     
-    # If still no key found, prompt user
+    # If still no key found or corrupted, prompt user
     if ([string]::IsNullOrWhiteSpace($retrievedApiKey)) {
-        Write-LogMessage "No API key found in environment variables, prompting user..." "INFO"
+        Write-LogMessage "No valid API key found, prompting user..." "INFO"
         
         if ($Gui) {
             do {
-                $retrievedApiKey = [Microsoft.VisualBasic.Interaction]::InputBox("OpenAI API key not found in environment variables.`n`nPlease enter your OpenAI API key:`n(Get one from: https://platform.openai.com/api-keys)", "API Key Required", "")
+                $retrievedApiKey = [Microsoft.VisualBasic.Interaction]::InputBox("OpenAI API key not found or corrupted in environment variables.`n`nPlease enter your OpenAI API key:`n(Get one from: https://platform.openai.com/api-keys)", "API Key Required", "")
                 
                 if ([string]::IsNullOrWhiteSpace($retrievedApiKey)) {
                     $result = [System.Windows.Forms.MessageBox]::Show("No API key entered. The application cannot function without a valid OpenAI API key.`n`nWould you like to try entering it again?", "API Key Required", "YesNo", "Question")
@@ -199,11 +235,30 @@ function Get-ApiKey {
                 } else {
                     # Clean the input
                     $retrievedApiKey = $retrievedApiKey.Trim().Replace("`r", "").Replace("`n", "").Replace("`t", "").Trim('"').Trim("'")
-                    break
+                    
+                    # Validate user input
+                    if ($retrievedApiKey -match "^sk-") {
+                        Write-LogMessage "Valid API key provided by user" "INFO"
+                        
+                        # Optionally save to environment
+                        $saveResult = [System.Windows.Forms.MessageBox]::Show("Would you like to save this API key to your environment variables for future use?", "Save API Key", "YesNo", "Question")
+                        if ($saveResult -eq "Yes") {
+                            try {
+                                [Environment]::SetEnvironmentVariable("OPENAI_API_KEY", $retrievedApiKey, "User")
+                                Write-LogMessage "API key saved to user environment variables" "INFO"
+                            } catch {
+                                Write-LogMessage "Could not save API key: $($_.Exception.Message)" "WARNING"
+                            }
+                        }
+                        break
+                    } else {
+                        [System.Windows.Forms.MessageBox]::Show("Invalid API key format. OpenAI keys should start with 'sk-'", "Invalid Format", "OK", "Warning")
+                        $retrievedApiKey = $null
+                    }
                 }
             } while ($true)
         } else {
-            Write-Host "OpenAI API key not found in environment variables." -ForegroundColor Yellow
+            Write-Host "OpenAI API key not found or corrupted in environment variables." -ForegroundColor Yellow
             Write-Host "You can get an API key from: https://platform.openai.com/api-keys" -ForegroundColor Cyan
             
             do {
@@ -216,7 +271,14 @@ function Get-ApiKey {
                 
                 if (-not [string]::IsNullOrWhiteSpace($retrievedApiKey)) {
                     $retrievedApiKey = $retrievedApiKey.Trim().Replace("`r", "").Replace("`n", "").Replace("`t", "").Trim('"').Trim("'")
-                    break
+                    
+                    if ($retrievedApiKey -match "^sk-") {
+                        Write-Host "Valid API key format detected" -ForegroundColor Green
+                        break
+                    } else {
+                        Write-Host "Invalid API key format. OpenAI keys should start with 'sk-'" -ForegroundColor Red
+                        $retrievedApiKey = $null
+                    }
                 }
             } while ($true)
         }
@@ -985,6 +1047,7 @@ Write-LogMessage "Starting DPSG initialization..." "INFO"
 
 $global:ApiKey = Get-ApiKey
 
+# Validate the global API key before proceeding
 if ([string]::IsNullOrWhiteSpace($global:ApiKey)) {
     Write-LogMessage "FATAL: No valid API key available. Cannot proceed." "ERROR"
     if ($Gui) {
@@ -993,7 +1056,35 @@ if ([string]::IsNullOrWhiteSpace($global:ApiKey)) {
     exit 1
 }
 
-Write-LogMessage "API key successfully loaded and validated" "INFO"
+# Double-check for corruption in global API key
+if ($global:ApiKey.Length -gt 300 -or $global:ApiKey -match "^\[\d{2}:\d{2}:\d{2}\]") {
+    Write-LogMessage "CRITICAL: Global API key is still corrupted after Get-ApiKey. Forcing user prompt." "ERROR"
+    Write-LogMessage "Corrupted global key: '$($global:ApiKey.Substring(0, [Math]::Min(50, $global:ApiKey.Length)))'" "DEBUG"
+    
+    if ($Gui) {
+        $newKey = [Microsoft.VisualBasic.Interaction]::InputBox("Your environment API key is corrupted with log data.`n`nPlease enter your clean OpenAI API key:", "Corrupted Environment Variable", "")
+        if (-not [string]::IsNullOrWhiteSpace($newKey) -and $newKey -match "^sk-") {
+            $global:ApiKey = $newKey.Trim()
+            Write-LogMessage "Global API key replaced with user-provided key" "INFO"
+        } else {
+            Write-LogMessage "User did not provide valid API key, exiting..." "ERROR"
+            [System.Windows.Forms.MessageBox]::Show("Cannot start DPSG without a valid OpenAI API key.", "Configuration Error", "OK", "Error")
+            exit 1
+        }
+    } else {
+        Write-Host "Your environment API key is corrupted with log data." -ForegroundColor Red
+        $newKey = Read-Host "Please enter your clean OpenAI API key"
+        if (-not [string]::IsNullOrWhiteSpace($newKey) -and $newKey -match "^sk-") {
+            $global:ApiKey = $newKey.Trim()
+            Write-LogMessage "Global API key replaced with user-provided key" "INFO"
+        } else {
+            Write-LogMessage "User did not provide valid API key, exiting..." "ERROR"
+            exit 1
+        }
+    }
+}
+
+Write-LogMessage "API key successfully validated - Length: $($global:ApiKey.Length)" "INFO"
 
 if ($PromptFile) {
     $promptContent = Get-Content -Raw $PromptFile
