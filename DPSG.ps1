@@ -394,10 +394,13 @@ function Request-ScriptGeneration {
         [Parameter(ParameterSetName="SingleInput")]
         [Parameter(ParameterSetName="ContextMessages")]
         [string]$SystemPrompt = @"
-You are a PowerShell expert assistant that generates complete, working PowerShell GUI applications.
-When generating PowerShell scripts, output only valid PowerShell code with no markdown or commentary.
-Focus on creating functional Windows Forms applications that users can run immediately.
-Include proper error handling and user-friendly interfaces.
+You are a PowerShell expert assistant that generates complete, working PowerShell scripts.
+When generating PowerShell scripts, output ONLY valid PowerShell code with NO markdown formatting whatsoever.
+Do NOT include code blocks, backticks, or any markdown syntax like ```powershell or ```.
+Focus on creating functional scripts that solve the user's requirements.
+Include proper error handling and clear, readable code.
+Only include GUI elements (Windows Forms) if specifically requested by the user.
+Start your response directly with PowerShell code.
 "@,
         [Parameter()]
         [ValidateNotNullOrEmpty()]
@@ -611,6 +614,14 @@ function New-PowerShellApp {
                 $template.Template
             } else {
                 Write-LogMessage "No matching template found, using API generation" "INFO"
+                $guiSystemPrompt = @"
+You are a PowerShell expert assistant that generates complete, working PowerShell GUI applications.
+When generating PowerShell scripts, output ONLY valid PowerShell code with NO markdown formatting whatsoever.
+Do NOT include code blocks, backticks, or any markdown syntax like ```powershell or ```.
+Focus on creating functional Windows Forms applications that users can run immediately.
+Include proper error handling and user-friendly interfaces.
+Start your response directly with PowerShell code.
+"@
                 Request-ScriptGeneration -ApiKey $global:ApiKey -UserInput @"
 Create a complete, working PowerShell GUI application based on: $cleanDescription
 
@@ -642,11 +653,19 @@ try {
 }
 
 Generate a complete, functional application based on this structure.
-"@
+"@ -SystemPrompt $guiSystemPrompt
             }
         } else {
             # ALWAYS use OpenAI API for dynamic generation (this is the main purpose!)
             Write-LogMessage "Using OpenAI API for dynamic generation" "INFO"
+            $guiSystemPrompt = @"
+You are a PowerShell expert assistant that generates complete, working PowerShell GUI applications.
+When generating PowerShell scripts, output ONLY valid PowerShell code with NO markdown formatting whatsoever.
+Do NOT include code blocks, backticks, or any markdown syntax like ```powershell or ```.
+Focus on creating functional Windows Forms applications that users can run immediately.
+Include proper error handling and user-friendly interfaces.
+Start your response directly with PowerShell code.
+"@
             Request-ScriptGeneration -ApiKey $global:ApiKey -UserInput @"
 Create a complete, working PowerShell GUI application based on: $UserDescription
 
@@ -678,7 +697,7 @@ try {
 }
 
 Generate a complete, functional application based on this structure.
-"@
+"@ -SystemPrompt $guiSystemPrompt
         }
 
         # Save the script
